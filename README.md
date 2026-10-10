@@ -1,35 +1,49 @@
-# FAERS Adverse Event Signal Detection Dashboard
+# FAERS Drug Safety Signal Dashboard (2015-2025)
 
-An end-to-end pharmacovigilance analytics project: loading raw FDA FAERS
-data into SQL Server, cleaning and deduplicating it, calculating drug
-safety signal scores (PRR/ROR), and visualizing the results in an
-interactive Power BI dashboard.
+An end-to-end pharmacovigilance analytics project. Ten years of raw FDA FAERS data
+(44 quarters) are loaded into SQL Server, cleaned and deduplicated, scored for drug
+safety signals (PRR/ROR), moved to Snowflake, and shown in an interactive Power BI dashboard.
+
+**Scale:** 15,187,311 unique cases | 44 quarters (2015 Q1 - 2025 Q4) | 2,518,819 validated drug-reaction pairs
 
 ---
 
-## Overview
+## Dashboard
 
-The FDA's FAERS (FDA Adverse Event Reporting System) publishes quarterly,
-raw spontaneous adverse event reports submitted by manufacturers,
-healthcare providers, and consumers. This project takes four quarters of
-2025 FAERS data (~1.6M raw case records) and turns it into a clean,
-statistically validated, interactive safety-signal dashboard.
+![Dashboard](screenshots/01_dashboard.png)
 
-**What this project demonstrates:**
-- Loading and reconciling a genuinely messy, multi-file government data format
-- SQL-based ETL: deduplication, unit conversion, outlier handling
-- Applying an established pharmacovigilance statistical method (PRR/ROR
-  disproportionality analysis) with the corrections real analysts use to
-  keep it statistically reliable
-- Building a multi-page, interactive Power BI dashboard on top of it
+The report has 5 pages: a one-screen **Dashboard** (KPI cards, outcome and sex donuts,
+yearly trend, top signals), **Signal Overview**, **Age and Sex**, **Outcome Severity**
+and **Trend**. A year slicer drives the cards and charts on the Dashboard page.
+
+**Download the Power BI file:** `FAERS_Dashboard_10Y.pbix` is over 100 MB, so it is attached to the
+[Releases page](../../releases) instead of the repository. Open it with Power BI Desktop; it is in
+Import mode, so it works without a Snowflake connection.
 
 ---
 
 ## Tech Stack
 
-- **SQL Server** — data loading, cleaning, deduplication, signal calculation
-- **Power BI** — interactive dashboard (drug search, drill-downs, trend analysis)
-- **Source data** — [FDA FAERS Quarterly Data Files](https://fis.fda.gov/extensions/FPD-QDE-FAERS/FPD-QDE-FAERS.html) (ASCII format, 2025 Q1–Q4)
+- **SQL Server**: loading, deduplication, cleaning, PRR/ROR calculation
+- **Python** (pandas, pyarrow, sqlalchemy, snowflake-connector): Parquet export and Snowflake load
+- **Snowflake**: cloud warehouse; summary tables built with SQL for the dashboard
+- **Power BI**: Import-mode dashboard with DAX measures and a shared Years dimension table
+- **Source data**: [FDA FAERS Quarterly Data Files](https://fis.fda.gov/extensions/FPD-QDE-FAERS/FPD-QDE-FAERS.html) (ASCII, 2015 Q1 - 2025 Q4)
+
+## Pipeline
+
+```
+FDA ASCII files (44 quarters, ~15 GB)
+        |  BULK INSERT (loop over quarters)
+        v
+SQL Server: staging -> raw -> dedup -> clean -> SIGNAL_SCORES (PRR/ROR)
+        |  Python: export to Parquet (500K-row parts)
+        v
+Snowflake: PUT + COPY INTO -> summary tables (per year, per quarter, top pairs)
+        |  Import mode
+        v
+Power BI dashboard (.pbix works offline after import)
+```
 
 ---
 
@@ -39,114 +53,100 @@ statistically validated, interactive safety-signal dashboard.
 faers-adverse-event-dashboard/
 ├── README.md
 ├── sql/
-│   └── faers_pipeline.sql        # full pipeline: schema, load, dedup, signal calc
-├── powerbi/
-│   └── FAERS_Dashboard.pbix      # Power BI file (optional — see note below)
+│   ├── faers_load_multi_year.sql       # schema + loop load of 44 quarters
+│   ├── faers_clean_signals_10y.sql     # dedup, date/age cleaning, PRR/ROR, outcome labels
+│   └── snowflake_summary_tables.sql    # summary tables used by Power BI
+├── python/
+│   ├── export_to_parquet_10y.py        # SQL Server -> Parquet
+│   └── upload_to_snowflake.py          # Parquet -> Snowflake (PUT / COPY INTO)
 └── screenshots/
-    ├── 01_signal_overview.png
-    ├── 02_drug_deep_dive.png
-    ├── 03_age_and_trend.png
-    └── 04_outcome_severity.png
 ```
-
-**Note on the `.pbix` file:** including it is optional. It lets anyone
-with Power BI Desktop open and interact with the dashboard themselves,
-but it can be large and doesn't diff/version well in Git. Screenshots in
-the README are what most people actually see when browsing the repo, so
-they matter more than the `.pbix` itself.
 
 ---
 
 ## Methodology
 
-### 1. Data Loading
-FAERS ships as 7 separate `$`-delimited ASCII files per quarter (DEMO,
-DRUG, REAC, OUTC, THER, INDI, RPSR), linked by `primaryid`. Files were
-loaded into staging tables shaped exactly like the source files, then
-pushed into tagged final tables — see `sql/faers_pipeline.sql` for the
-full loop-based load logic across all 4 quarters.
+### 1. Loading (2015 Q1 - 2025 Q4)
+FAERS ships 7 `$`-delimited files per quarter (DEMO, DRUG, REAC, OUTC, THER, INDI, RPSR).
+A loop loads each quarter into staging tables shaped exactly like the files, then copies them
+into tagged raw tables. Older years needed wider columns (full country names, large ages),
+and line endings differ between files and quarters, so every file is read with an LF
+terminator and any stray carriage return is stripped.
 
 ### 2. Deduplication
-FAERS reissues a case under a new `caseversion` whenever it's corrected
-or updated, rather than overwriting the original. Only the latest
-version of each case is kept (with a tiebreaker for the rare cases where
-two rows share the same max version), reducing ~1.6M raw rows to
-**1,466,941 unique cases**.
+FAERS reissues a case under a higher `caseversion` instead of overwriting it. Only the latest
+version of each case is kept (with a tiebreaker on `primaryid` for rare ties), giving
+**15,187,311 unique cases**.
 
-### 3. Data Cleaning
-- Converted FAERS' text-based dates into real `DATE` columns
-- Normalized `age` (which FAERS stores in mixed units — years, months,
-  weeks, days, hours) into a single `age_years` value, capping a small
-  number of clearly invalid entries (e.g. one recorded age of 962)
-- Bucketed ages into readable groups (0–17, 18–40, 41–65, 66+, Unknown)
+### 3. Cleaning
+- Text dates converted to real `DATE` columns
+- Age normalized from mixed units (years, decades, months, weeks, days, hours) to `age_years`;
+  implausible values (over 120) set to NULL
+- Age bucketed into 0-17, 18-40, 41-65, 66+ and Unknown
+- Outcome codes mapped to readable labels (Death, Hospitalization, and so on)
 
-### 4. Signal Detection (PRR / ROR)
-For every drug–reaction pair, calculated:
-- **PRR** (Proportional Reporting Ratio)
-- **ROR** (Reporting Odds Ratio)
+### 4. Signal detection (PRR / ROR)
+For every drug-reaction pair a 2x2 table is built and **PRR** and **ROR** are calculated with a
+**Haldane-Anscombe continuity correction**. Pairs need at least 3 cases (Evans criteria), and
+three reliability filters remove unstable ratios caused by low drug volume, low reaction volume
+or a near-zero comparison group. Result: **2,518,819 validated pairs**.
 
-with a **Haldane-Anscombe continuity correction** (standard in
-pharmacovigilance) to handle zero-count cells, followed by three
-reliability filters to remove statistically unstable pairs caused by
-low drug volume, low reaction volume, or a near-zero comparison group.
-**562,737 validated drug-reaction pairs** remain after filtering.
+### 5. Warehouse and summary tables
+Parquet exports are loaded to Snowflake with `PUT` and `COPY INTO` (row counts verified against
+the source for all 5 tables). Small summary tables (cases per quarter, age and sex per year,
+outcomes per year, top 1,000 pairs by year) keep the Power BI file small.
 
-### 5. Dashboard
-Built in Power BI across 4 pages:
-- **Signal Overview** — sortable/searchable table of all validated
-  drug–reaction pairs with PRR/ROR, plus a data-limitations disclosure
-- **Drug Deep-Dive** — drug picker with top-10 reactions by case count
-- **Cases by Age Group** — age distribution and reporting trend over time
-- **Outcome Severity** — case counts by clinical outcome (Death,
-  Hospitalization, Life-Threatening, etc.)
-
----
-
-## Key Data-Quality Decisions
-
-A few notable issues in the raw data that this pipeline explicitly
-addresses (details are commented directly in `faers_pipeline.sql`):
-
-- FAERS' `BULK INSERT` requires the staging table's column count to
-  match the file exactly — a mismatch silently corrupts the last columns
-- The `DRUG` file uses CRLF line endings; the other six files use LF only
-- A small percentage of rows contain embedded delimiter characters inside
-  free-text fields, requiring a tolerant error threshold rather than
-  hand-fixing each row
-- Raw PRR/ROR values can be wildly inflated (into the millions) for three
-  distinct statistical reasons, each requiring its own filter — not just
-  a single "minimum count" rule
+### 6. Power BI
+- Import mode, so the `.pbix` keeps working without Snowflake
+- A `Years` dimension table with one-to-many relationships to the summary tables, so one slicer
+  filters several tables
+- DAX measures: `Total Cases`, `Total Pairs`, `Strong Signals`, `Deaths`, `Death %`,
+  `Pair Cases`, `YoY %`, `Avg ROR`
+  (strong signal = at least 3 cases, PRR >= 2 and ROR >= 2)
+- Conditional formatting (data bars on case counts, gradient on ROR), drop-down slicers,
+  heatmap matrix, cross-filtering between visuals
 
 ---
 
-## Screenshots
+## Key Findings
 
-### Signal Overview
-![Signal Overview](screenshots/01_signal_overview.png)
-
-### Drug Deep-Dive
-![Drug Deep-Dive](screenshots/02_drug_deep_dive.png)
-
-### Cases by Age Group & Reporting Trend
-![Age Group and Trend](screenshots/03_age_and_trend.png)
-
-### Outcome Severity
-![Outcome Severity](screenshots/04_outcome_severity.png)
+1. **Report volume grew about 20% over the decade**, from 1.22M cases in 2015 to 1.47M in 2025,
+   peaking at 1.58M in 2021 and falling about 14% by 2024 before recovering.
+2. **Serious outcomes peaked in 2020.** Hospitalization reports reached 312,668 and deaths
+   141,991, the highest of any year. Deaths were about 9.9% of that year's reports, against
+   8.6% in 2015 and 7.5% in 2025.
+3. **8.6% of all cases include a death outcome** (1.30M of 15.19M); "Other Serious" is the
+   largest outcome group at 53.5% of outcome records.
+4. **Volume and statistical signal are different things.** HUMIRA / Drug ineffective has 66,861
+   cases but an ROR of only 2.41, while OXYCONTIN / Drug dependence has 90,444 cases and an ROR
+   of 619.79, and DUPIXENT / Dermatitis atopic has an ROR of 353.17.
+5. **Women make up about 52% of reports and men 35%**; about 14% have no sex recorded.
 
 ---
+
+## Data-Quality Notes
+
+- About 40% of cases have no usable age (the `Unknown` group is the largest in the age chart)
+- Some sex codes (`I`, `P`, `T`, `UNK`, blank) are rare or missing and are shown as reported
+- Some drug names are raw free text (for example `*ASPIRIN`, `.ALPHA.-TOCOPHEROL`) and are not
+  standardized, so the same drug can appear under several names
+- A handful of DRUG rows per quarter are skipped because of embedded `$` delimiters in free text
+  (negligible against tens of millions of rows)
+- 2018 Q1 DEMO was loaded manually from `DEMO18Q1_new.txt`
+- The Trend page's drug and heatmap visuals cover only the **top 1,000 signals** (at least 20
+  cases, ranked by ROR), so they are not an overall trend; the yearly case chart covers all cases
+- `SIGNAL_SCORES` is one score per pair across all years, so signal tables do not respond to
+  the year slicer
+- Outcome counts add up to more than total cases because one case can have several outcomes
 
 ## Limitations
 
-FAERS is a spontaneous reporting system. Reports do not establish that a
-drug caused a reported reaction, and the data is subject to reporting
-bias, duplicate submissions, and incomplete information. PRR/ROR values
-indicate statistical disproportionality, not confirmed causal safety
-signals — this is standard practice and caveat in real pharmacovigilance
-work, not a limitation unique to this project.
-
----
+FAERS is a spontaneous reporting system. Reports do not prove that a drug caused a reaction,
+and the data has reporting bias, duplicate submissions and missing information. PRR/ROR show
+statistical disproportionality, not confirmed safety signals. This is a standard caveat in real
+pharmacovigilance work.
 
 ## Data Source
 
-FDA FAERS Quarterly Data Files (ASCII), 2025 Q1–Q4:
+FDA FAERS Quarterly Data Files (ASCII), 2015 Q1 - 2025 Q4:
 https://fis.fda.gov/extensions/FPD-QDE-FAERS/FPD-QDE-FAERS.html
