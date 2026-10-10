@@ -20,6 +20,20 @@ and **Trend**. A year slicer drives the cards and charts on the Dashboard page.
 [Releases page](../../releases) instead of the repository. Open it with Power BI Desktop; it is in
 Import mode, so it works without a Snowflake connection.
 
+### More pages
+
+**Signal Overview**
+![Signal Overview](screenshots/02_signal_overview.png)
+
+**Age and Sex**
+![Age and Sex](screenshots/03_age_and_sex.png)
+
+**Outcome Severity**
+![Outcome Severity](screenshots/04_outcome_severity.png)
+
+**Trend**
+![Trend](screenshots/05_trend.png)
+
 ---
 
 ## Tech Stack
