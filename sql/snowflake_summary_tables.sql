@@ -1,0 +1,44 @@
+/* ============================================================================
+   SNOWFLAKE SUMMARY TABLES FOR POWER BI
+   Run after upload_to_snowflake.py has loaded SIGNAL_SCORES, DEMO, REAC, OUTC
+   and DRUG_SUSPECT into FAERS_10Y.PUBLIC.
+   These small tables keep the Power BI file small (Import mode).
+   ============================================================================ */
+
+USE DATABASE FAERS_10Y;
+USE SCHEMA PUBLIC;
+
+-- 1. Cases per quarter (QUARTER looks like '2015Q1')
+CREATE OR REPLACE TABLE SUM_CASES_QUARTER AS
+SELECT QUARTER, LEFT(QUARTER,4) AS YEAR, COUNT(*) AS CASES
+FROM DEMO GROUP BY 1,2;
+
+-- 2. Age group and sex per year
+CREATE OR REPLACE TABLE SUM_AGE_SEX_YEAR AS
+SELECT LEFT(QUARTER,4) AS YEAR, AGE_GROUP, SEX, COUNT(*) AS CASES
+FROM DEMO GROUP BY 1,2,3;
+
+-- 3. Outcomes per year (distinct cases per outcome)
+CREATE OR REPLACE TABLE SUM_OUTCOME_YEAR AS
+SELECT LEFT(QUARTER,4) AS YEAR, OUTCOME_LABEL, COUNT(DISTINCT PRIMARYID) AS CASES
+FROM OUTC GROUP BY 1,2;
+
+-- 4. Top 1,000 signal pairs (at least 20 cases, ranked by ROR) and their cases per year
+CREATE OR REPLACE TABLE TOP_PAIRS AS
+SELECT DRUGNAME, PT, A, PRR, ROR
+FROM SIGNAL_SCORES WHERE A >= 20
+ORDER BY ROR DESC LIMIT 1000;
+
+CREATE OR REPLACE TABLE SUM_PAIR_YEAR AS
+SELECT LEFT(d.QUARTER,4) AS YEAR, d.DRUGNAME, r.PT,
+       COUNT(DISTINCT d.PRIMARYID) AS CASES
+FROM DRUG_SUSPECT d
+JOIN REAC r ON r.PRIMARYID = d.PRIMARYID
+JOIN TOP_PAIRS t ON t.DRUGNAME = d.DRUGNAME AND t.PT = r.PT
+GROUP BY 1,2,3;
+
+-- Sanity checks: expected 44 / 1,000 / 3,764 rows, and 15,187,311 total cases
+-- SELECT COUNT(*) FROM SUM_CASES_QUARTER;
+-- SELECT COUNT(*) FROM TOP_PAIRS;
+-- SELECT COUNT(*) FROM SUM_PAIR_YEAR;
+-- SELECT SUM(CASES) FROM SUM_CASES_QUARTER;
